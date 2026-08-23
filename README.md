@@ -50,6 +50,11 @@ Running `gmail-emigration` without arguments starts guided setup. It will:
 8. Validate every generated mailbox.
 9. Offer to open the ranked account-change note.
 
+At path prompts, you can paste a normal path, paste a shell-escaped path such as
+`/Users/name/All\ mail.mbox`, include surrounding quotes, or drag the `.mbox` file
+into the terminal. Arrow keys edit the current response, and up/down arrows recall
+responses from the current run when the platform provides standard readline support.
+
 No third-party runtime packages are required. The script can also be run directly:
 
 ```bash

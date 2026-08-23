@@ -190,6 +190,24 @@ class ConfigurationTests(unittest.TestCase):
     def test_all_category_selection_is_default(self):
         self.assertEqual(migration.parse_categories(None), set(migration.IMPORT_CATEGORIES))
 
+    def test_interactive_path_accepts_plain_spaces_and_shell_escapes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            expected = Path(temp_dir) / "All mail Including Spam and Trash-002.mbox"
+            expected.touch()
+
+            self.assertEqual(migration.normalize_interactive_path(str(expected)), expected.resolve())
+            escaped = str(expected).replace(" ", r"\ ")
+            self.assertEqual(migration.normalize_interactive_path(escaped), expected.resolve())
+
+    def test_interactive_path_accepts_quotes_and_file_urls(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            expected = Path(temp_dir) / "All mail.mbox"
+            expected.touch()
+            escaped = str(expected).replace(" ", r"\ ")
+
+            self.assertEqual(migration.normalize_interactive_path(f'"{escaped}"'), expected.resolve())
+            self.assertEqual(migration.normalize_interactive_path(expected.as_uri()), expected.resolve())
+
     def test_guided_mode_accepts_one_source_and_selected_categories(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

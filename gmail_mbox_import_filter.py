@@ -23,6 +23,7 @@ import json
 import mailbox
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections import Counter
@@ -34,9 +35,15 @@ from email.policy import default
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import BinaryIO, Iterable, Sequence
+from urllib.parse import unquote, urlparse
+
+try:
+    import readline as _readline
+except ImportError:  # pragma: no cover - platform-dependent optional support
+    _readline = None
 
 
-VERSION = "4.0.0"
+VERSION = "4.0.1"
 
 IMPORT_CATEGORIES = (
     "01_FINANCE_TAX_RECORDS",
@@ -1476,6 +1483,19 @@ def human_size(size: int) -> str:
     return f"{size} B"
 
 
+def configure_terminal_input() -> None:
+    """Enable in-session history and arrow-key editing when readline is available."""
+    if _readline is None or not sys.stdin.isatty():
+        return
+    try:
+        binding = "bind -e" if "libedit" in (_readline.__doc__ or "") else "set editing-mode emacs"
+        _readline.parse_and_bind(binding)
+        _readline.set_history_length(100)
+    except (AttributeError, RuntimeError):
+        # Basic input still works on Python builds with a limited readline backend.
+        pass
+
+
 def prompt_text(question: str, default_value: str = "") -> str:
     suffix = f" [{default_value}]" if default_value else ""
     try:
@@ -1483,6 +1503,30 @@ def prompt_text(question: str, default_value: str = "") -> str:
     except (EOFError, KeyboardInterrupt) as exc:
         raise RuntimeError("interactive setup canceled") from exc
     return response or default_value
+
+
+def normalize_interactive_path(value: str) -> Path:
+    """Accept plain, quoted, shell-escaped, or file-URL paths pasted at a prompt."""
+    candidate = value.strip()
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {'"', "'"}:
+        candidate = candidate[1:-1].strip()
+
+    if candidate.casefold().startswith("file://"):
+        parsed = urlparse(candidate)
+        if parsed.scheme.casefold() == "file":
+            candidate = unquote(parsed.path)
+
+    # Terminal drag-and-drop and shell copying commonly produce paths such as
+    # /Users/name/All\ mail.mbox. Preserve already-valid paths containing spaces,
+    # but decode shell escapes when the value represents one shell token.
+    try:
+        shell_parts = shlex.split(candidate, posix=True)
+    except ValueError:
+        shell_parts = []
+    if len(shell_parts) == 1:
+        candidate = shell_parts[0]
+
+    return Path(candidate).expanduser().resolve()
 
 
 def prompt_yes_no(question: str, default: bool = False) -> bool:
@@ -1523,7 +1567,7 @@ def choose_mbox_path(discovered: list[Path], used: set[Path]) -> Path:
             return available[int(value) - 1]
     else:
         value = prompt_text("Full path to the Google Takeout .mbox file")
-    return Path(value).expanduser().resolve()
+    return normalize_interactive_path(value)
 
 
 def preview_sources(
@@ -1619,6 +1663,7 @@ def interactive_configuration(
     args: argparse.Namespace,
     initial_sources: list[SourceSpec],
 ) -> tuple[list[SourceSpec], str, Path, bool, bool, set[str], bool]:
+    configure_terminal_input()
     print("\nGmail Emigration — guided setup")
     print("=" * 34)
     print("This tool works locally with Google Takeout .mbox exports.")
@@ -1635,6 +1680,8 @@ def interactive_configuration(
             print("Please enter 1 or 2.")
         discovered = discover_mbox_files(Path.cwd())
         used: set[Path] = set()
+        if not discovered:
+            print("Tip: paste or drag the .mbox file here; quoted and shell-escaped paths are accepted.\n")
         for index in range(source_count):
             while True:
                 account = prompt_text(f"Old Gmail address #{index + 1}").lower()
@@ -1648,6 +1695,7 @@ def interactive_configuration(
                     sources.append(SourceSpec(account, path))
                     break
                 print(f"File not found: {path}")
+                print("Try dragging the .mbox file into this window, or paste its path without editing it.")
     else:
         print("Using source files supplied by flags:")
         for item in sources:
