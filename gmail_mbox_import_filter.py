@@ -34,7 +34,7 @@ from email.message import Message
 from email.policy import default
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
-from typing import BinaryIO, Iterable, Sequence
+from typing import BinaryIO, Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 try:
@@ -43,7 +43,75 @@ except ImportError:  # pragma: no cover - platform-dependent optional support
     _readline = None
 
 
-VERSION = "4.0.1"
+VERSION = "4.1.0"
+
+TERMINAL_THEMES = {
+    "none": {},
+    "dark": {
+        "title": "\033[1;96m",
+        "heading": "\033[1;94m",
+        "accent": "\033[94m",
+        "success": "\033[1;92m",
+        "warning": "\033[1;93m",
+        "muted": "\033[90m",
+    },
+    "light": {
+        "title": "\033[1;34m",
+        "heading": "\033[1;35m",
+        "accent": "\033[35m",
+        "success": "\033[1;32m",
+        "warning": "\033[1;31m",
+        "muted": "\033[90m",
+    },
+}
+ANSI_RESET = "\033[0m"
+_ACTIVE_TERMINAL_THEME: Mapping[str, str] = TERMINAL_THEMES["none"]
+
+
+def detect_terminal_theme(
+    requested: str = "auto",
+    *,
+    environment: Mapping[str, str] | None = None,
+    is_terminal: bool | None = None,
+) -> str:
+    """Choose a readable theme without putting ANSI codes in redirected output."""
+    environment = os.environ if environment is None else environment
+    terminal = sys.stdout.isatty() if is_terminal is None else is_terminal
+    if not terminal or "NO_COLOR" in environment:
+        return "none"
+
+    selected = requested.casefold()
+    override = environment.get("GMAIL_EMIGRATION_THEME", "").casefold()
+    if selected == "auto" and override in TERMINAL_THEMES:
+        selected = override
+    if selected in TERMINAL_THEMES:
+        return selected
+
+    color_fgbg = environment.get("COLORFGBG", "")
+    try:
+        background = int(color_fgbg.split(";")[-1]) % 16
+    except (TypeError, ValueError):
+        background = 0
+    return "light" if background in {7, 9, 10, 11, 12, 13, 14, 15} else "dark"
+
+
+def configure_terminal_theme(
+    requested: str = "auto",
+    *,
+    environment: Mapping[str, str] | None = None,
+    is_terminal: bool | None = None,
+) -> str:
+    global _ACTIVE_TERMINAL_THEME
+    selected = detect_terminal_theme(requested, environment=environment, is_terminal=is_terminal)
+    _ACTIVE_TERMINAL_THEME = TERMINAL_THEMES[selected]
+    return selected
+
+
+def colorize(value: object, role: str) -> str:
+    text = str(value)
+    prefix = _ACTIVE_TERMINAL_THEME.get(role, "")
+    return f"{prefix}{text}{ANSI_RESET}" if prefix else text
+
 
 IMPORT_CATEGORIES = (
     "01_FINANCE_TAX_RECORDS",
@@ -981,7 +1049,7 @@ def render_progress(
         f"\r  [{bar}] {ratio:6.1%}  {current:,}/{total:,}  "
         f"keep {imports:,}  review {reviews:,}"
     )
-    print(line, end="\n" if force else "", flush=True)
+    print(colorize(line, "accent"), end="\n" if force else "", flush=True)
 
 
 def write_decision_header(writer: csv.writer) -> None:
@@ -1162,7 +1230,8 @@ def process_source(
                         )
                 except Exception as exc:
                     failed_count += 1
-                    print(f"Warning: message {total:,} in {source_path.name} could not be processed: {exc}", file=sys.stderr)
+                    warning = f"Warning: message {total:,} in {source_path.name} could not be processed: {exc}"
+                    print(colorize(warning, "warning"), file=sys.stderr)
 
                 if total % 250 == 0:
                     render_progress(
@@ -1539,7 +1608,7 @@ def prompt_yes_no(question: str, default: bool = False) -> bool:
             return True
         if answer in {"n", "no"}:
             return False
-        print("Please answer yes or no.")
+        print(colorize("Please answer yes or no.", "warning"))
 
 
 def discover_mbox_files(root: Path) -> list[Path]:
@@ -1559,7 +1628,7 @@ def discover_mbox_files(root: Path) -> list[Path]:
 def choose_mbox_path(discovered: list[Path], used: set[Path]) -> Path:
     available = [path for path in discovered if path not in used]
     if available:
-        print("\nDetected mbox files (the largest files are usually Google Takeout sources):")
+        print(colorize("\nDetected mbox files (the largest files are usually Google Takeout sources):", "heading"))
         for index, path in enumerate(available[:12], start=1):
             print(f"  {index}. {path} ({human_size(path.stat().st_size)})")
         value = prompt_text("Choose a number or enter the full mbox path", "1")
@@ -1578,7 +1647,8 @@ def preview_sources(
     include_routine_purchases: bool,
 ) -> Counter[str]:
     combined: Counter[str] = Counter()
-    print(f"\nPreviewing up to {limit:,} messages per source. No output mailboxes are written yet.")
+    preview = f"\nPreviewing up to {limit:,} messages per source. No output mailboxes are written yet."
+    print(colorize(preview, "heading"))
     for source_spec in sources:
         box = mailbox.mbox(source_spec.path, create=False)
         scanned = 0
@@ -1605,7 +1675,7 @@ def preview_sources(
         finally:
             box.close()
         if failures:
-            print(f"  Preview warnings for {source_spec.account}: {failures:,}")
+            print(colorize(f"  Preview warnings for {source_spec.account}: {failures:,}", "warning"))
     return combined
 
 
@@ -1647,7 +1717,7 @@ def parse_categories(value: str | None) -> set[str]:
 
 
 def prompt_categories(preview_counts: Counter[str]) -> set[str]:
-    print("\nChoose which durable-record categories should be exported:")
+    print(colorize("\nChoose which durable-record categories should be exported:", "heading"))
     for index, category in enumerate(IMPORT_CATEGORIES, start=1):
         observed = preview_counts[category]
         print(f"  {index}. {CATEGORY_DESCRIPTIONS[category]} (preview matched {observed:,})")
@@ -1656,7 +1726,7 @@ def prompt_categories(preview_counts: Counter[str]) -> set[str]:
         try:
             return parse_categories(value)
         except ValueError as exc:
-            print(f"Please try again: {exc}")
+            print(colorize(f"Please try again: {exc}", "warning"))
 
 
 def interactive_configuration(
@@ -1664,11 +1734,11 @@ def interactive_configuration(
     initial_sources: list[SourceSpec],
 ) -> tuple[list[SourceSpec], str, Path, bool, bool, set[str], bool]:
     configure_terminal_input()
-    print("\nGmail Emigration — guided setup")
-    print("=" * 34)
+    print(colorize("\nGmail Emigration — guided setup", "title"))
+    print(colorize("=" * 34, "accent"))
     print("This tool works locally with Google Takeout .mbox exports.")
     print("If needed, request Gmail data at https://takeout.google.com and extract the download first.")
-    print("Your email content is never uploaded by this program.\n")
+    print(colorize("Your email content is never uploaded by this program.\n", "muted"))
 
     sources = list(initial_sources)
     if not sources:
@@ -1677,7 +1747,7 @@ def interactive_configuration(
             if count_value in {"1", "2"}:
                 source_count = int(count_value)
                 break
-            print("Please enter 1 or 2.")
+            print(colorize("Please enter 1 or 2.", "warning"))
         discovered = discover_mbox_files(Path.cwd())
         used: set[Path] = set()
         if not discovered:
@@ -1687,15 +1757,16 @@ def interactive_configuration(
                 account = prompt_text(f"Old Gmail address #{index + 1}").lower()
                 if "@" in account:
                     break
-                print("Enter a complete email address.")
+                print(colorize("Enter a complete email address.", "warning"))
             while True:
                 path = choose_mbox_path(discovered, used)
                 if path.is_file():
                     used.add(path)
                     sources.append(SourceSpec(account, path))
                     break
-                print(f"File not found: {path}")
-                print("Try dragging the .mbox file into this window, or paste its path without editing it.")
+                print(colorize(f"File not found: {path}", "warning"))
+                retry_tip = "Try dragging the .mbox file into this window, or paste its path without editing it."
+                print(colorize(retry_tip, "muted"))
     else:
         print("Using source files supplied by flags:")
         for item in sources:
@@ -1705,7 +1776,7 @@ def interactive_configuration(
     while "@" not in new_email:
         new_email = prompt_text("New iCloud email address").lower()
         if "@" not in new_email:
-            print("Enter a complete email address.")
+            print(colorize("Enter a complete email address.", "warning"))
     include_spam_trash = args.include_spam_trash or prompt_yes_no(
         "Consider precisely matched messages in Gmail Spam/Trash?",
         False,
@@ -1735,7 +1806,7 @@ def interactive_configuration(
         if not prompt_yes_no("That output folder contains files. Replace generated files in it?", False):
             raise RuntimeError("choose a new or empty output folder")
 
-    print("\nReady to run:")
+    print(colorize("\nReady to run:", "heading"))
     for item in sources:
         print(f"  - {item.account}: {item.path}")
     print(f"  - New email: {new_email or '(not provided)'}")
@@ -1814,6 +1885,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also import food-delivery and similar routine purchase receipts (off by default)",
     )
+    parser.add_argument(
+        "--theme",
+        choices=("auto", "dark", "light", "none"),
+        default="auto",
+        help="Terminal color theme (default: auto; also honors NO_COLOR)",
+    )
     report_group = parser.add_mutually_exclusive_group()
     report_group.add_argument(
         "--open-report",
@@ -1832,6 +1909,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_terminal_theme(args.theme)
     if args.preview_limit < 1:
         parser.error("--preview-limit must be at least 1")
 
@@ -1856,7 +1934,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 prompt_to_open,
             ) = interactive_configuration(args, sources)
         except (RuntimeError, ValueError) as exc:
-            print(f"\n{exc}", file=sys.stderr)
+            print(colorize(f"\n{exc}", "warning"), file=sys.stderr)
             return 130
     else:
         new_email = args.new_email.strip()
@@ -1886,9 +1964,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("output folder is not empty; choose another --out path or pass --overwrite-output")
     output_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"Gmail Emigration v{VERSION}")
-    print(f"Output: {output_root}")
-    print("Policy: only precise durable records are imported; account evidence is tracked separately.")
+    print(colorize(f"Gmail Emigration v{VERSION}", "title"))
+    print(f"Output: {colorize(output_root, 'accent')}")
+    policy = "Policy: only precise durable records are imported; account evidence is tracked separately."
+    print(colorize(policy, "muted"))
     if not include_spam_trash:
         print("Spam and Trash are excluded.")
     print(f"Selected durable-record categories: {len(selected_categories)}/{len(IMPORT_CATEGORIES)}")
@@ -1898,7 +1977,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     results: list[dict[str, object]] = []
 
     for item in sources:
-        print(f"\nScanning {item.account}: {item.path}")
+        print(colorize(f"\nScanning {item.account}: {item.path}", "heading"))
         result = process_source(
             item,
             output_root,
@@ -1909,12 +1988,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidates=candidates,
         )
         results.append(result)
-        print(
+        done = (
             f"  Done: {result['messages_scanned']:,} scanned; "
             f"{result['messages_import_ready']:,} import; "
             f"{result['messages_for_manual_review']:,} review; "
             f"{result['messages_excluded']:,} excluded"
         )
+        print(colorize(done, "success"))
 
     checklist_path = write_account_checklist(output_root, candidates, new_email)
     account_note_path = write_account_note(output_root, candidates, new_email)
@@ -1948,13 +2028,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     total_import = sum(int(item["messages_import_ready"]) for item in results)
     total_review = sum(int(item["messages_for_manual_review"]) for item in results)
     total_failed = sum(int(item["processing_failures"]) for item in results)
-    print("\nMigration set complete.")
+    print(colorize("\nMigration set complete.", "success"))
     print(f"Scanned: {total_scanned:,}; import-ready: {total_import:,}; manual review: {total_review:,}")
     print(f"Account/service candidates: {len(candidates):,}; processing failures: {total_failed:,}")
     print(f"Account checklist: {checklist_path}")
     print(f"Readable account note: {account_note_path}")
     print(f"Exact import list: {manifest_path}")
-    print(f"Mbox validation: {validation_path} ({validation['status']})")
+    validation_role = "success" if validation["status"] == "PASS" else "warning"
+    print(colorize(f"Mbox validation: {validation_path} ({validation['status']})", validation_role))
     print(f"Run summary: {summary_path}")
     exit_code = 1 if total_failed or validation["status"] != "PASS" else 0
     should_open = args.open_report

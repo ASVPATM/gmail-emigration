@@ -190,6 +190,40 @@ class ConfigurationTests(unittest.TestCase):
     def test_all_category_selection_is_default(self):
         self.assertEqual(migration.parse_categories(None), set(migration.IMPORT_CATEGORIES))
 
+    def test_terminal_theme_auto_detects_dark_and_light_backgrounds(self):
+        self.assertEqual(
+            migration.detect_terminal_theme("auto", environment={"COLORFGBG": "15;0"}, is_terminal=True),
+            "dark",
+        )
+        self.assertEqual(
+            migration.detect_terminal_theme("auto", environment={"COLORFGBG": "0;15"}, is_terminal=True),
+            "light",
+        )
+
+    def test_terminal_theme_respects_overrides_and_plain_output(self):
+        self.assertEqual(
+            migration.detect_terminal_theme(
+                "auto",
+                environment={"GMAIL_EMIGRATION_THEME": "light"},
+                is_terminal=True,
+            ),
+            "light",
+        )
+        self.assertEqual(
+            migration.detect_terminal_theme("dark", environment={"NO_COLOR": ""}, is_terminal=True),
+            "none",
+        )
+        self.assertEqual(migration.detect_terminal_theme("dark", environment={}, is_terminal=False), "none")
+
+    def test_terminal_theme_emits_ansi_only_for_a_terminal(self):
+        try:
+            migration.configure_terminal_theme("dark", environment={}, is_terminal=True)
+            self.assertIn("\033[", migration.colorize("Complete", "success"))
+            migration.configure_terminal_theme("dark", environment={}, is_terminal=False)
+            self.assertNotIn("\033[", migration.colorize("Complete", "success"))
+        finally:
+            migration.configure_terminal_theme("none", environment={}, is_terminal=True)
+
     def test_interactive_path_accepts_plain_spaces_and_shell_escapes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             expected = Path(temp_dir) / "All mail Including Spam and Trash-002.mbox"
