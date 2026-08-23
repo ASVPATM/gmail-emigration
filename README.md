@@ -1,5 +1,11 @@
 # Gmail Emigration
 
+<p align="center">
+  <img src="gmail_icon.jpg" alt="Gmail app icon" height="140">
+  &nbsp;&nbsp;&nbsp;→&nbsp;&nbsp;&nbsp;
+  <img src="icloud_icon.jpg" alt="iCloud app icon" height="140">
+</p>
+
 Create a small, high-confidence Gmail-to-iCloud migration set from Google Takeout
 `.mbox` files. Everything runs locally: the tool never signs in, uploads mail, or
 changes the original archive.
@@ -76,4 +82,5 @@ bodies. Confirm every domain before entering credentials.
 
 Run tests with `python3 -m unittest discover -s tests -v`.
 
-MIT licensed. See [LICENSE](LICENSE).
+MIT licensed. See [LICENSE](LICENSE). Gmail and iCloud are trademarks of their
+respective owners; this independent project is not affiliated with Google or Apple.
