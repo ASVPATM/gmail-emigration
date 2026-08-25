@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gmail-emigration"
-version = "4.1.0"
-description = "Create a privacy-first, essentials-only Gmail-to-iCloud migration set from Google Takeout mbox files."
+version = "4.2.0"
+description = "Create privacy-first Gmail-to-iCloud migration mailboxes and account checklists from Google Takeout."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}

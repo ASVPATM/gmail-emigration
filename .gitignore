@@ -19,6 +19,7 @@ dist/
 
 # Default/generated migration outputs. Keep them locally; never commit them.
 gmail_icloud_migration*/
+gmail_icloud_sent_mail*/
 gmail_import_filtered_output*/
 gmail_deep_audit_output/
 **/gmail_deep_audit_output/
@@ -26,6 +27,8 @@ gmail_deep_audit_output/
 **/ACCOUNT_CHANGE_CHECKLIST.md
 **/MESSAGE_DECISIONS.csv
 **/MANUAL_REVIEW.csv
+**/SENT_MAIL_SKIPPED.csv
+**/SENT_MAIL_SUMMARY.json
 **/CATEGORY_SUMMARY.csv
 **/MIGRATION_SUMMARY.json
 **/MBOX_VALIDATION.json

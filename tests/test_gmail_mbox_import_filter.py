@@ -36,6 +36,16 @@ def classify(subject: str, sender: str, labels: str = "Inbox,Important") -> migr
 
 
 class ClassificationTests(unittest.TestCase):
+    def test_sent_detection_prefers_gmail_label_and_supports_label_free_exports(self):
+        labeled = make_message("Sent message", "Alias <alias@example.com>", labels="Sent,Important")
+        self.assertTrue(migration.is_sent_message(labeled, "former.address@gmail.com"))
+
+        incoming = make_message("Incoming", "Person <person@example.com>", labels="Inbox")
+        self.assertFalse(migration.is_sent_message(incoming, "former.address@gmail.com"))
+
+        label_free = make_message("Old sent", "Former <former.address@gmail.com>", labels="")
+        self.assertTrue(migration.is_sent_message(label_free, "former.address@gmail.com"))
+
     def test_job_alert_is_not_an_application_record(self):
         decision = classify(
             'Jobs like "Software Engineer" in Portland',
@@ -175,8 +185,81 @@ class MboxTests(unittest.TestCase):
             self.assertEqual({row["service_domain"] for row in rows}, {"google.com", "paypal.com"})
             self.assertTrue((out / "ACCOUNT_CHANGE_CHECKLIST.md").is_file())
 
+    def test_sent_only_combines_two_sources_into_one_deduplicated_mbox(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.mbox"
+            second = root / "second.mbox"
+            out = root / "sent-output"
+            duplicate = make_message(
+                "Sent from the first account",
+                "First <one@gmail.com>",
+                labels="Sent",
+                message_id="<sent-duplicate@example.com>",
+            )
+            incoming = make_message(
+                "Incoming message",
+                "Person <person@example.com>",
+                labels="Inbox",
+                message_id="<incoming@example.com>",
+            )
+            unique = make_message(
+                "Sent from the second account",
+                "Second <two@gmail.com>",
+                labels="Sent,Important",
+                message_id="<sent-unique@example.com>",
+            )
+            for path, messages in ((first, [duplicate, incoming]), (second, [duplicate, unique])):
+                with path.open("wb") as output:
+                    for message in messages:
+                        migration.write_raw_message(
+                            output,
+                            message.as_bytes(),
+                            migration.parse_message_date(message["Date"]),
+                        )
+
+            result = migration.main(
+                [
+                    "--source",
+                    f"one@gmail.com={first}",
+                    "--source",
+                    f"two@gmail.com={second}",
+                    "--parts",
+                    "sent",
+                    "--out",
+                    str(out),
+                ]
+            )
+            self.assertEqual(result, 0)
+
+            sent_box = mailbox.mbox(out / "08_SENT_MAIL.mbox", create=False)
+            try:
+                self.assertEqual(len(sent_box), 2)
+                self.assertEqual(
+                    {message["Subject"] for message in sent_box},
+                    {"Sent from the first account", "Sent from the second account"},
+                )
+                self.assertTrue(all(message["Date"] == "Mon, 03 Feb 2020 10:11:12 -0800" for message in sent_box))
+            finally:
+                sent_box.close()
+
+            manifest_lines = (out / "IMPORT_THESE_FILES.txt").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                [line for line in manifest_lines if line.endswith(".mbox")],
+                [str((out / "08_SENT_MAIL.mbox").resolve())],
+            )
+            validation = (out / "MBOX_VALIDATION.json").read_text(encoding="utf-8")
+            self.assertIn('"status": "PASS"', validation)
+            self.assertFalse((out / "ACCOUNT_CHANGE_CHECKLIST.md").exists())
+            self.assertTrue((out / "SENT_MAIL_SUMMARY.json").is_file())
+
 
 class ConfigurationTests(unittest.TestCase):
+    def test_data_parts_accept_numbers_names_and_defaults(self):
+        self.assertEqual(migration.parse_data_parts(None), {"essentials", "accounts"})
+        self.assertEqual(migration.parse_data_parts("2"), {"sent"})
+        self.assertEqual(migration.parse_data_parts("records, sent, checklist"), set(migration.DATA_PART_ORDER))
+
     def test_category_names_and_numbers_can_be_selected(self):
         self.assertEqual(
             migration.parse_categories("finance, 4, gaming"),
@@ -257,6 +340,7 @@ class ConfigurationTests(unittest.TestCase):
 
             answers = iter(
                 [
+                    "",
                     "1",
                     "former.address@gmail.com",
                     "1",
@@ -285,6 +369,36 @@ class ConfigurationTests(unittest.TestCase):
             self.assertIn("new.address@icloud.com", note)
             self.assertTrue((output_dir / "former.address_gmail.com" / "01_FINANCE_TAX_RECORDS.mbox").is_file())
             self.assertFalse((output_dir / "former.address_gmail.com" / "07_GAMING_ACCOUNT_PURCHASES.mbox").exists())
+
+    def test_guided_start_menu_can_select_sent_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "takeout.mbox"
+            output_dir = root / "sent-migration"
+            message = make_message("A sent message", "Former <former.address@gmail.com>", labels="Sent")
+            with source.open("wb") as output:
+                migration.write_raw_message(
+                    output,
+                    message.as_bytes(),
+                    migration.parse_message_date(message["Date"]),
+                )
+
+            answers = iter(["2", "", ""])
+            with patch("builtins.input", side_effect=lambda _prompt: next(answers)):
+                result = migration.main(
+                    [
+                        "--source",
+                        f"former.address@gmail.com={source}",
+                        "--interactive",
+                        "--out",
+                        str(output_dir),
+                        "--no-open-report",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertTrue((output_dir / "08_SENT_MAIL.mbox").is_file())
+            self.assertFalse((output_dir / "former.address_gmail.com").exists())
 
     def test_flag_mode_refuses_nonempty_output_without_opt_in(self):
         with tempfile.TemporaryDirectory() as temp_dir:

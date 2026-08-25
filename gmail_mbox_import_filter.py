@@ -43,7 +43,16 @@ except ImportError:  # pragma: no cover - platform-dependent optional support
     _readline = None
 
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
+
+SENT_CATEGORY = "08_SENT_MAIL"
+MAX_ICLOUD_MESSAGE_BYTES = 20_000_000
+DATA_PART_ORDER = ("essentials", "sent", "accounts")
+DATA_PART_DESCRIPTIONS = {
+    "essentials": "Essential non-sent records for iCloud",
+    "sent": "Sent email in one combined mailbox",
+    "accounts": "Account-change checklist",
+}
 
 TERMINAL_THEMES = {
     "none": {},
@@ -129,6 +138,7 @@ EXCLUDE_CATEGORIES = (
     "92_MARKETING_NEWSLETTERS",
     "93_SPAM_TRASH",
     "94_CATEGORY_NOT_SELECTED",
+    "95_SENT_MAIL_NOT_SELECTED",
     "98_NOT_ESSENTIAL",
 )
 
@@ -620,9 +630,27 @@ def message_hash(msg: Message, raw_bytes: bytes, account: str, index: int) -> st
     return hashlib.sha256(basis.encode("utf-8", errors="replace")).hexdigest()
 
 
+def sent_message_hash(msg: Message, raw_bytes: bytes) -> str:
+    """Create a cross-account identity for combining sent mail."""
+    message_id = clean_text(msg.get("Message-ID", ""))
+    basis = "message-id\0" + message_id.casefold() if message_id else "raw\0" + hashlib.sha256(raw_bytes).hexdigest()
+    return hashlib.sha256(basis.encode("utf-8", errors="replace")).hexdigest()
+
+
 def gmail_labels(msg: Message) -> set[str]:
     raw = clean_text(msg.get("X-Gmail-Labels", ""))
     return {item.strip().casefold() for item in raw.split(",") if item.strip()}
+
+
+def is_sent_message(msg: Message, source_account: str) -> bool:
+    """Prefer Gmail's exact Sent label, with a fallback for label-free exports."""
+    labels = gmail_labels(msg)
+    if "sent" in labels:
+        return True
+    if labels:
+        return False
+    _sender_name, sender_email = parse_name_email(msg.get("From", ""))
+    return sender_email.casefold() == source_account.casefold()
 
 
 def attachment_info(msg: Message) -> tuple[int, list[str]]:
@@ -1123,6 +1151,7 @@ def process_source(
     selected_categories: set[str],
     seen_messages: set[str],
     candidates: dict[str, AccountCandidate],
+    collect_candidates: bool,
 ) -> dict[str, object]:
     source_path = source_spec.path.resolve()
     account_dir = output_root / account_slug(source_spec.account)
@@ -1165,6 +1194,15 @@ def process_source(
                         include_spam_trash=include_spam_trash,
                         include_routine_purchases=include_routine_purchases,
                     )
+                    if is_sent_message(message, source_spec.account):
+                        decision = Decision(
+                            "EXCLUDE",
+                            "95_SENT_MAIL_NOT_SELECTED",
+                            "sent_mail_separate_part",
+                            "high",
+                            ["sent mail is exported only when the Sent email data part is selected"],
+                            [],
+                        )
                     if decision.should_import and decision.category not in selected_categories:
                         original_category = decision.category
                         decision = Decision(
@@ -1205,7 +1243,8 @@ def process_source(
                         "account_or_subscription_change",
                     }
                     if (
-                        decision.account_evidence
+                        collect_candidates
+                        and decision.account_evidence
                         and metadata["root_domain"]
                         and decision.category != "93_SPAM_TRASH"
                         and not processor_record_only
@@ -1283,6 +1322,152 @@ def process_source(
         "selected_categories": sorted(selected_categories),
         "account_output_folder": str(account_dir),
     }
+
+
+def extract_sent_mail(
+    sources: list[SourceSpec],
+    output_root: Path,
+) -> dict[str, object]:
+    """Combine Gmail Sent-labeled messages from every source into one mbox."""
+    final_path = output_root / f"{SENT_CATEGORY}.mbox"
+    temp_path = output_root / f".{SENT_CATEGORY}.mbox.partial"
+    skipped_path = output_root / "SENT_MAIL_SKIPPED.csv"
+    summary_path = output_root / "SENT_MAIL_SUMMARY.json"
+    seen_messages: set[str] = set()
+    total_scanned = 0
+    sent_matches = 0
+    imported = 0
+    duplicate_count = 0
+    oversized_count = 0
+    failed_count = 0
+    imported_bytes = 0
+    source_stats: list[dict[str, object]] = []
+    success = False
+
+    with temp_path.open("wb") as sent_file, skipped_path.open("w", encoding="utf-8", newline="") as skipped_file:
+        skipped_writer = csv.writer(skipped_file)
+        skipped_writer.writerow(
+            ["source_account", "reason", "message_index", "date", "from", "to", "subject", "bytes", "message_hash"]
+        )
+        try:
+            for source_spec in sources:
+                source_scanned = 0
+                source_matches = 0
+                source_imported = 0
+                source_failures = 0
+                source_box = mailbox.mbox(source_spec.path.resolve(), create=False)
+                try:
+                    expected_total = len(source_box)
+                    for key in source_box.iterkeys():
+                        source_scanned += 1
+                        total_scanned += 1
+                        try:
+                            raw_bytes = source_box.get_bytes(key)
+                            try:
+                                message = message_from_bytes(raw_bytes, policy=default)
+                            except Exception:
+                                message = message_from_bytes(raw_bytes)
+                            if not is_sent_message(message, source_spec.account):
+                                continue
+
+                            source_matches += 1
+                            sent_matches += 1
+                            digest = sent_message_hash(message, raw_bytes)
+                            date_header = clean_text(message.get("Date", ""))
+                            common_row = [
+                                source_spec.account,
+                                "",
+                                source_scanned,
+                                date_header,
+                                clean_text(message.get("From", "")),
+                                clean_text(message.get("To", "")),
+                                clean_text(message.get("Subject", "")),
+                                len(raw_bytes),
+                                digest,
+                            ]
+                            if digest in seen_messages:
+                                duplicate_count += 1
+                                common_row[1] = "duplicate_message"
+                                skipped_writer.writerow(common_row)
+                                continue
+                            if len(raw_bytes) > MAX_ICLOUD_MESSAGE_BYTES:
+                                oversized_count += 1
+                                common_row[1] = "over_20mb_icloud_limit"
+                                skipped_writer.writerow(common_row)
+                                continue
+
+                            write_raw_message(sent_file, raw_bytes, parse_message_date(date_header))
+                            seen_messages.add(digest)
+                            source_imported += 1
+                            imported += 1
+                            imported_bytes += len(raw_bytes)
+                        except Exception as exc:
+                            failed_count += 1
+                            source_failures += 1
+                            warning = (
+                                f"Warning: sent message {source_scanned:,} in {source_spec.path.name} "
+                                f"could not be processed: {exc}"
+                            )
+                            print(colorize(warning, "warning"), file=sys.stderr)
+
+                        if source_scanned % 250 == 0:
+                            render_progress(
+                                source_spec.account,
+                                source_scanned,
+                                expected_total,
+                                source_imported,
+                                0,
+                            )
+
+                    render_progress(
+                        source_spec.account,
+                        source_scanned,
+                        expected_total,
+                        source_imported,
+                        0,
+                        force=True,
+                    )
+                finally:
+                    source_box.close()
+
+                source_stats.append(
+                    {
+                        "source_account": source_spec.account,
+                        "input_mbox": str(source_spec.path.resolve()),
+                        "messages_scanned": source_scanned,
+                        "sent_messages_matched": source_matches,
+                        "sent_messages_imported": source_imported,
+                        "processing_failures": source_failures,
+                    }
+                )
+            success = True
+        finally:
+            sent_file.flush()
+
+    if success:
+        temp_path.replace(final_path)
+
+    result: dict[str, object] = {
+        "source_account": "Combined sent mail",
+        "input_mbox": [str(item.path.resolve()) for item in sources],
+        "messages_scanned": total_scanned,
+        "messages_import_ready": imported,
+        "messages_for_manual_review": 0,
+        "messages_excluded": total_scanned - imported - failed_count,
+        "duplicates_excluded": duplicate_count,
+        "oversized_messages_skipped": oversized_count,
+        "processing_failures": failed_count,
+        "sent_messages_matched": sent_matches,
+        "category_counts": {SENT_CATEGORY: imported},
+        "selected_categories": [SENT_CATEGORY],
+        "account_output_folder": str(output_root),
+        "sent_mailbox": str(final_path),
+        "sent_skipped_report": str(skipped_path),
+        "approx_source_bytes": imported_bytes,
+        "sources": source_stats,
+    }
+    summary_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
 
 
 def sorted_candidate_rows(
@@ -1473,7 +1658,7 @@ def validate_output_mboxes(output_root: Path, source_results: list[dict[str, obj
                     actual += 1
                     message_size = len(raw_bytes)
                     file_largest_message_bytes = max(file_largest_message_bytes, message_size)
-                    if message_size > 20_000_000:
+                    if message_size > MAX_ICLOUD_MESSAGE_BYTES:
                         over_20mb += 1
                     date_header = clean_text(message.get("Date", ""))
                     if not date_header:
@@ -1619,7 +1804,7 @@ def discover_mbox_files(root: Path) -> list[Path]:
         relative_parts = path.relative_to(root).parts
         if any(part.startswith(("gmail_icloud_migration", "gmail_import_filtered_output")) for part in relative_parts):
             continue
-        if path.stem in IMPORT_CATEGORIES or path.name.endswith(".partial"):
+        if path.stem in IMPORT_CATEGORIES or path.stem == SENT_CATEGORY or path.name.endswith(".partial"):
             continue
         candidates.append(path.resolve())
     return sorted(candidates, key=lambda path: path.stat().st_size, reverse=True)
@@ -1692,6 +1877,49 @@ CATEGORY_ALIASES = {
     "gaming": "07_GAMING_ACCOUNT_PURCHASES",
 }
 
+DATA_PART_ALIASES = {
+    "records": "essentials",
+    "essential": "essentials",
+    "essentials": "essentials",
+    "sent": "sent",
+    "sent-mail": "sent",
+    "accounts": "accounts",
+    "checklist": "accounts",
+}
+
+
+def parse_data_parts(value: str | None) -> set[str]:
+    if not value or value.strip().casefold() in {"recommended", "default"}:
+        return {"essentials", "accounts"}
+    if value.strip().casefold() == "all":
+        return set(DATA_PART_ORDER)
+    selected: set[str] = set()
+    for token in re.split(r"[,\s]+", value.strip()):
+        folded = token.casefold()
+        if not folded:
+            continue
+        if folded.isdigit() and 1 <= int(folded) <= len(DATA_PART_ORDER):
+            selected.add(DATA_PART_ORDER[int(folded) - 1])
+        elif folded in DATA_PART_ALIASES:
+            selected.add(DATA_PART_ALIASES[folded])
+        else:
+            raise ValueError(f"unknown data part: {token}")
+    if not selected:
+        raise ValueError("select at least one data part")
+    return selected
+
+
+def prompt_data_parts() -> set[str]:
+    print(colorize("\nChoose which parts of your Gmail data to extract:", "heading"))
+    for index, part in enumerate(DATA_PART_ORDER, start=1):
+        print(f"  {index}. {DATA_PART_DESCRIPTIONS[part]}")
+    while True:
+        value = prompt_text("Data parts: comma-separated numbers, or all", "1,3")
+        try:
+            return parse_data_parts(value)
+        except ValueError as exc:
+            print(colorize(f"Please try again: {exc}", "warning"))
+
 
 def parse_categories(value: str | None) -> set[str]:
     if not value or value.strip().casefold() in {"all", "recommended"}:
@@ -1732,13 +1960,15 @@ def prompt_categories(preview_counts: Counter[str]) -> set[str]:
 def interactive_configuration(
     args: argparse.Namespace,
     initial_sources: list[SourceSpec],
-) -> tuple[list[SourceSpec], str, Path, bool, bool, set[str], bool]:
+) -> tuple[list[SourceSpec], str, Path, bool, bool, set[str], set[str], bool]:
     configure_terminal_input()
     print(colorize("\nGmail Emigration — guided setup", "title"))
     print(colorize("=" * 34, "accent"))
     print("This tool works locally with Google Takeout .mbox exports.")
     print("If needed, request Gmail data at https://takeout.google.com and extract the download first.")
     print(colorize("Your email content is never uploaded by this program.\n", "muted"))
+
+    selected_parts = parse_data_parts(args.parts) if args.parts else prompt_data_parts()
 
     sources = list(initial_sources)
     if not sources:
@@ -1773,27 +2003,41 @@ def interactive_configuration(
             print(f"  - {item.account}: {item.path}")
 
     new_email = args.new_email.strip()
-    while "@" not in new_email:
-        new_email = prompt_text("New iCloud email address").lower()
-        if "@" not in new_email:
-            print(colorize("Enter a complete email address.", "warning"))
-    include_spam_trash = args.include_spam_trash or prompt_yes_no(
-        "Consider precisely matched messages in Gmail Spam/Trash?",
-        False,
-    )
-    include_routine_purchases = args.include_routine_purchases or prompt_yes_no(
-        "Import routine food-delivery purchase receipts?",
-        False,
-    )
-    preview_counts = preview_sources(
-        sources,
-        limit=args.preview_limit,
-        include_spam_trash=include_spam_trash,
-        include_routine_purchases=include_routine_purchases,
-    )
-    selected_categories = parse_categories(args.categories) if args.categories else prompt_categories(preview_counts)
+    if "accounts" in selected_parts:
+        while "@" not in new_email:
+            new_email = prompt_text("New iCloud email address").lower()
+            if "@" not in new_email:
+                print(colorize("Enter a complete email address.", "warning"))
+
+    classify_non_sent = bool(selected_parts & {"essentials", "accounts"})
+    include_spam_trash = args.include_spam_trash
+    if classify_non_sent and not include_spam_trash:
+        include_spam_trash = prompt_yes_no(
+            "Consider precisely matched messages in Gmail Spam/Trash?",
+            False,
+        )
+
+    include_routine_purchases = args.include_routine_purchases
+    selected_categories: set[str] = set()
+    if "essentials" in selected_parts:
+        if not include_routine_purchases:
+            include_routine_purchases = prompt_yes_no(
+                "Import routine food-delivery purchase receipts?",
+                False,
+            )
+        preview_counts = preview_sources(
+            sources,
+            limit=args.preview_limit,
+            include_spam_trash=include_spam_trash,
+            include_routine_purchases=include_routine_purchases,
+        )
+        selected_categories = (
+            parse_categories(args.categories) if args.categories else prompt_categories(preview_counts)
+        )
 
     default_out = args.out
+    if selected_parts == {"sent"} and default_out == "gmail_icloud_migration":
+        default_out = "gmail_icloud_sent_mail"
     default_path = Path(default_out).expanduser()
     if default_path.is_dir() and any(default_path.iterdir()):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1809,8 +2053,13 @@ def interactive_configuration(
     print(colorize("\nReady to run:", "heading"))
     for item in sources:
         print(f"  - {item.account}: {item.path}")
-    print(f"  - New email: {new_email or '(not provided)'}")
-    print(f"  - Categories: {len(selected_categories)} selected")
+    print(f"  - Data parts: {', '.join(part for part in DATA_PART_ORDER if part in selected_parts)}")
+    if "accounts" in selected_parts:
+        print(f"  - New email: {new_email or '(not provided)'}")
+    if "essentials" in selected_parts:
+        print(f"  - Categories: {len(selected_categories)} selected")
+    if "sent" in selected_parts:
+        print(f"  - Sent output: {SENT_CATEGORY}.mbox (combined across sources)")
     print(f"  - Output: {output_root}")
     if not prompt_yes_no("Start the full migration scan?", True):
         raise RuntimeError("migration canceled before writing output")
@@ -1821,7 +2070,8 @@ def interactive_configuration(
         include_spam_trash,
         include_routine_purchases,
         selected_categories,
-        True,
+        selected_parts,
+        "accounts" in selected_parts,
     )
 
 
@@ -1851,7 +2101,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_source,
         default=[],
         metavar="OLD_GMAIL=PATH",
-        help="Input source; repeat for a combined multi-account checklist",
+        help="Input source; repeat for a combined two-account extraction",
     )
     parser.add_argument("--out", default="gmail_icloud_migration", help="Output folder (default: gmail_icloud_migration)")
     parser.add_argument(
@@ -1863,6 +2113,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--categories",
         default=None,
         help="Comma-separated category numbers/names, or 'all' (default: all)",
+    )
+    parser.add_argument(
+        "--parts",
+        default=None,
+        help="Data parts: essentials, sent, accounts, or comma-separated values (default: essentials,accounts)",
     )
     parser.add_argument(
         "--interactive",
@@ -1931,6 +2186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 include_spam_trash,
                 include_routine_purchases,
                 selected_categories,
+                selected_parts,
                 prompt_to_open,
             ) = interactive_configuration(args, sources)
         except (RuntimeError, ValueError) as exc:
@@ -1943,7 +2199,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         include_routine_purchases = args.include_routine_purchases
         prompt_to_open = False
         try:
-            selected_categories = parse_categories(args.categories)
+            selected_parts = parse_data_parts(args.parts)
+            selected_categories = parse_categories(args.categories) if "essentials" in selected_parts else set()
         except ValueError as exc:
             parser.error(str(exc))
 
@@ -1966,38 +2223,58 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(colorize(f"Gmail Emigration v{VERSION}", "title"))
     print(f"Output: {colorize(output_root, 'accent')}")
-    policy = "Policy: only precise durable records are imported; account evidence is tracked separately."
+    selected_part_names = ", ".join(part for part in DATA_PART_ORDER if part in selected_parts)
+    policy = f"Selected data parts: {selected_part_names}."
     print(colorize(policy, "muted"))
-    if not include_spam_trash:
+    if selected_parts & {"essentials", "accounts"} and not include_spam_trash:
         print("Spam and Trash are excluded.")
-    print(f"Selected durable-record categories: {len(selected_categories)}/{len(IMPORT_CATEGORIES)}")
+    if "essentials" in selected_parts:
+        print(f"Selected durable-record categories: {len(selected_categories)}/{len(IMPORT_CATEGORIES)}")
 
     seen_messages: set[str] = set()
     candidates: dict[str, AccountCandidate] = {}
     results: list[dict[str, object]] = []
 
-    for item in sources:
-        print(colorize(f"\nScanning {item.account}: {item.path}", "heading"))
-        result = process_source(
-            item,
-            output_root,
-            include_spam_trash=include_spam_trash,
-            include_routine_purchases=include_routine_purchases,
-            selected_categories=selected_categories,
-            seen_messages=seen_messages,
-            candidates=candidates,
-        )
-        results.append(result)
-        done = (
-            f"  Done: {result['messages_scanned']:,} scanned; "
-            f"{result['messages_import_ready']:,} import; "
-            f"{result['messages_for_manual_review']:,} review; "
-            f"{result['messages_excluded']:,} excluded"
-        )
-        print(colorize(done, "success"))
+    if selected_parts & {"essentials", "accounts"}:
+        for item in sources:
+            print(colorize(f"\nScanning non-sent mail for {item.account}: {item.path}", "heading"))
+            result = process_source(
+                item,
+                output_root,
+                include_spam_trash=include_spam_trash,
+                include_routine_purchases=include_routine_purchases,
+                selected_categories=selected_categories,
+                seen_messages=seen_messages,
+                candidates=candidates,
+                collect_candidates="accounts" in selected_parts,
+            )
+            results.append(result)
+            done = (
+                f"  Done: {result['messages_scanned']:,} scanned; "
+                f"{result['messages_import_ready']:,} import; "
+                f"{result['messages_for_manual_review']:,} review; "
+                f"{result['messages_excluded']:,} excluded"
+            )
+            print(colorize(done, "success"))
 
-    checklist_path = write_account_checklist(output_root, candidates, new_email)
-    account_note_path = write_account_note(output_root, candidates, new_email)
+    sent_result: dict[str, object] | None = None
+    if "sent" in selected_parts:
+        print(colorize("\nExtracting one combined Sent mailbox:", "heading"))
+        sent_result = extract_sent_mail(sources, output_root)
+        results.append(sent_result)
+        sent_done = (
+            f"  Done: {sent_result['sent_messages_matched']:,} sent matched; "
+            f"{sent_result['messages_import_ready']:,} imported; "
+            f"{sent_result['duplicates_excluded']:,} duplicates; "
+            f"{sent_result['oversized_messages_skipped']:,} over 20 MB"
+        )
+        print(colorize(sent_done, "success"))
+
+    checklist_path: Path | None = None
+    account_note_path: Path | None = None
+    if "accounts" in selected_parts:
+        checklist_path = write_account_checklist(output_root, candidates, new_email)
+        account_note_path = write_account_note(output_root, candidates, new_email)
     manifest_path = write_import_manifest(output_root, results)
     validation_path, validation = validate_output_mboxes(output_root, results)
     summary_path = output_root / "MIGRATION_SUMMARY.json"
@@ -2007,6 +2284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "policy": {
             "include_spam_trash": include_spam_trash,
             "include_routine_purchases": include_routine_purchases,
+            "selected_data_parts": sorted(selected_parts),
             "selected_categories": sorted(selected_categories),
             "manual_review_messages_are_imported": False,
             "transient_security_messages_are_imported": False,
@@ -2015,8 +2293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "sources": results,
         "account_change_candidates": len(candidates),
-        "account_change_checklist": str(checklist_path),
-        "account_change_note": str(account_note_path),
+        "account_change_checklist": str(checklist_path) if checklist_path else None,
+        "account_change_note": str(account_note_path) if account_note_path else None,
         "new_email": new_email,
         "import_manifest": str(manifest_path),
         "mbox_validation": str(validation_path),
@@ -2030,18 +2308,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     total_failed = sum(int(item["processing_failures"]) for item in results)
     print(colorize("\nMigration set complete.", "success"))
     print(f"Scanned: {total_scanned:,}; import-ready: {total_import:,}; manual review: {total_review:,}")
-    print(f"Account/service candidates: {len(candidates):,}; processing failures: {total_failed:,}")
-    print(f"Account checklist: {checklist_path}")
-    print(f"Readable account note: {account_note_path}")
+    if "accounts" in selected_parts:
+        print(f"Account/service candidates: {len(candidates):,}")
+        print(f"Account checklist: {checklist_path}")
+        print(f"Readable account note: {account_note_path}")
+    if sent_result:
+        print(f"Combined sent mailbox: {sent_result['sent_mailbox']}")
+        if int(sent_result["oversized_messages_skipped"]) or int(sent_result["duplicates_excluded"]):
+            print(f"Sent messages not copied: {sent_result['sent_skipped_report']}")
+    print(f"Processing failures: {total_failed:,}")
     print(f"Exact import list: {manifest_path}")
     validation_role = "success" if validation["status"] == "PASS" else "warning"
     print(colorize(f"Mbox validation: {validation_path} ({validation['status']})", validation_role))
     print(f"Run summary: {summary_path}")
     exit_code = 1 if total_failed or validation["status"] != "PASS" else 0
-    should_open = args.open_report
-    if prompt_to_open and not args.no_open_report:
+    should_open = bool(args.open_report and account_note_path)
+    if prompt_to_open and account_note_path and not args.no_open_report:
         should_open = prompt_yes_no("Open the account-change note now?", True)
-    if should_open:
+    if should_open and account_note_path:
         if open_local_file(account_note_path):
             print("Opened the account-change note.")
         else:
